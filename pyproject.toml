@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ess-predictor"
+version = "0.1.0"
+description = "Module B: Time-Series Drift Predictor for high-reliability electronics ESS/burn-in screening."
+requires-python = ">=3.9"
+dependencies = [
+    "pandas",
+    "numpy",
+    "scikit-learn",
+    "xgboost",
+    "matplotlib",
+    "shap",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]

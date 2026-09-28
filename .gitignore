@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+
+# Project outputs (generated, not source)
+/plots/*
+/outputs/*
+/models_store/*
+!/plots/.gitkeep
+!/outputs/.gitkeep
+!/models_store/.gitkeep
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
