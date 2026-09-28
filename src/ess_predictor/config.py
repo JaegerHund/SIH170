@@ -103,6 +103,35 @@ MIN_LOT_SIZE_FOR_STATS = 5          # below this, fall back to global stats
 N_GROUP_FOLDS = 5
 RANDOM_STATE = 42
 
+# Synthetic generator tuning. Relative effects are intentionally kept here so
+# the data-generating assumptions are reviewable without changing safety logic.
+SYNTHETIC_DATA_CONFIG = {
+    "lot_baseline_std": 0.025,
+    "component_baseline_std": 0.035,
+    "lot_degradation_std": 0.18,
+    "component_degradation_std": 0.25,
+    "lot_process_std": 0.006,
+    "component_process_std": 0.006,
+    "temporal_process_std": 0.004,
+    "temporal_process_rho": 0.65,
+    "measurement_noise_frac": {
+        "Iddq": 0.015,
+        "Leakage": 0.020,
+        "PropagationDelay": 0.010,
+        "Icc": 0.015,
+        "Vth": 0.008,
+        "RdsOn": 0.015,
+    },
+    "parameter_sensitivity": {
+        "Iddq": 1.15,
+        "Leakage": 1.30,
+        "PropagationDelay": 0.85,
+        "Icc": 0.95,
+        "Vth": 0.55,
+        "RdsOn": 1.10,
+    },
+}
+
 # Conformal prediction
 CONFORMAL_ALPHA = 0.10              # -> 90% prediction interval
 

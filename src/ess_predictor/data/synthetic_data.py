@@ -1,32 +1,16 @@
-"""
-synthetic_data.py
-------------------
-Optional synthetic-data generator for development/testing ONLY.
+"""Hierarchical synthetic ESS data generator for development and testing."""
 
-IMPORTANT: This data is synthetic and must never be treated as a substitute
-for real experimental validation data (see spec section 17 / 19). Every
-DataFrame produced here is tagged with a `Data_Source = "SYNTHETIC"` column
-so downstream code and reports can never silently confuse it with real
-measurements.
-
-Simulated behaviors per component (chosen per-component at random, weighted):
-  - normal:               gentle, expected drift
-  - gradual_degradation:   steady upward drift, crosses threshold late
-  - abrupt_degradation:    sharp change appearing between 24h and 96h/168h
-  - high_initial_stable:   starts high (but within spec) and stays flat
-                           -> should NOT be falsely flagged
-  - latent_defect:         normal-looking at 0h, accelerating drift after
-                           -> the hard case Module B exists to catch
-  - static_limit_escape:   ends up under the absolute datasheet limit but
-                           with abnormal drift shape -> must be caught by
-                           relative-drift / z-score logic, not the static
-                           limit
-"""
+import hashlib
 
 import numpy as np
 import pandas as pd
 
-from ess_predictor.config import PARAMETERS, TIMEPOINTS, RANDOM_STATE
+from ess_predictor.config import (
+    PARAMETERS,
+    RANDOM_STATE,
+    SYNTHETIC_DATA_CONFIG,
+    TIMEPOINTS,
+)
 
 BEHAVIOR_WEIGHTS = {
     "normal": 0.55,
@@ -37,58 +21,48 @@ BEHAVIOR_WEIGHTS = {
     "static_limit_escape": 0.05,
 }
 
+BASELINES = {
+    "Iddq": 10.0,
+    "Leakage": 8.0,
+    "PropagationDelay": 12.0,
+    "Icc": 25.0,
+    "Vth": 2.0,
+    "RdsOn": 45.0,
+}
 
-def _trajectory(base, behavior, rng, noise_frac=0.02):
-    """Return dict {0:..,24:..,96:..,168:..} for one parameter of one part."""
-    t = np.array(TIMEPOINTS, dtype=float)
 
+def _lot_rng(seed, lot_id):
+    """Make lot-specific randomness stable across processes and Python runs."""
+    token = f"{int(seed)}:{lot_id}".encode("utf-8")
+    lot_seed = int.from_bytes(hashlib.sha256(token).digest()[:8], "big")
+    return np.random.default_rng(lot_seed)
+
+
+def _drift_profile(behavior, rng, tendency):
+    """Return nonnegative relative drift at the four configured timepoints."""
+    t = np.asarray(TIMEPOINTS, dtype=float) / max(TIMEPOINTS)
     if behavior == "normal":
-        # ~2-6% total drift over the run, smooth
-        total_drift_frac = rng.uniform(0.02, 0.06)
-        shape = (t / t.max()) ** 1.0
-        vals = base * (1 + total_drift_frac * shape)
-
-    elif behavior == "gradual_degradation":
-        total_drift_frac = rng.uniform(0.35, 0.70)
-        shape = (t / t.max()) ** 1.2
-        vals = base * (1 + total_drift_frac * shape)
-
-    elif behavior == "abrupt_degradation":
-        # flat then a step between 24h and 96h
-        step_frac = rng.uniform(0.5, 1.2)
-        vals = np.array([base, base * 1.02,
-                          base * (1 + step_frac * 0.8),
-                          base * (1 + step_frac)])
-
-    elif behavior == "high_initial_stable":
-        # starts elevated (e.g. 1.5-2.5x a "typical" base) but flat afterward
-        elevated = base * rng.uniform(1.5, 2.2)
-        vals = np.full(4, elevated) * (1 + rng.uniform(-0.01, 0.03, size=4))
-
-    elif behavior == "latent_defect":
-        # innocuous at 0h/24h, accelerating after
-        early_drift = rng.uniform(0.03, 0.10)
-        late_accel = rng.uniform(0.6, 1.3)
-        vals = np.array([
-            base,
-            base * (1 + early_drift),
-            base * (1 + early_drift + late_accel * 0.55),
-            base * (1 + early_drift + late_accel),
-        ])
-
-    elif behavior == "static_limit_escape":
-        # large relative drift, but engineered to stay under a generous
-        # absolute datasheet ceiling (handled at generation call site)
-        total_drift_frac = rng.uniform(0.8, 1.4)
-        shape = (t / t.max()) ** 1.1
-        vals = base * (1 + total_drift_frac * shape)
-
-    else:
-        raise ValueError(behavior)
-
-    noise = rng.normal(0, noise_frac * base, size=4)
-    vals = vals + noise
-    return {int(tp): float(v) for tp, v in zip(t, vals)}
+        end = rng.uniform(0.02, 0.06) * np.clip(tendency, 0.5, 1.7)
+        exponent = rng.uniform(0.85, 1.35)
+        return end * t**exponent + rng.normal(0, 0.002, len(t)) * t
+    if behavior == "gradual_degradation":
+        end = rng.uniform(0.35, 0.70) * np.clip(tendency, 0.65, 1.45)
+        return end * t**rng.uniform(1.15, 1.65)
+    if behavior == "abrupt_degradation":
+        onset = rng.uniform(45.0, 105.0)
+        end = rng.uniform(0.50, 1.20) * np.clip(tendency, 0.65, 1.45)
+        progress = np.clip((np.asarray(TIMEPOINTS, dtype=float) - onset) / (168.0 - onset), 0, 1)
+        return end * progress**rng.uniform(0.75, 1.25)
+    if behavior == "latent_defect":
+        early = rng.uniform(0.025, 0.085) * np.clip(tendency, 0.7, 1.4)
+        late = rng.uniform(0.50, 1.05) * np.clip(tendency, 0.7, 1.4)
+        return early * t + late * t**rng.uniform(1.8, 2.5)
+    if behavior == "static_limit_escape":
+        end = rng.uniform(0.80, 1.40) * np.clip(tendency, 0.7, 1.35)
+        return end * t**rng.uniform(0.9, 1.35)
+    if behavior == "high_initial_stable":
+        return np.zeros(len(t), dtype=float)
+    raise ValueError(behavior)
 
 
 def generate_synthetic_dataset(
@@ -98,67 +72,108 @@ def generate_synthetic_dataset(
     temperatures=(125,),
     seed: int = RANDOM_STATE,
 ) -> pd.DataFrame:
-    """
-    Generate a synthetic ESS burn-in dataset with the same wide-column
-    structure described in the spec (section 3), for all parameters in
-    config.PARAMETERS.
+    """Return one row per component with the established wide measurement schema."""
+    if n_components < 0 or n_lots < 1:
+        raise ValueError("n_components must be nonnegative and n_lots must be positive")
+    if n_components and (not device_types or not temperatures):
+        raise ValueError("device_types and temperatures must be nonempty")
 
-    Returns a DataFrame with one row per Component_ID.
-    """
     rng = np.random.default_rng(seed)
-    behaviors = list(BEHAVIOR_WEIGHTS.keys())
-    weights = np.array(list(BEHAVIOR_WEIGHTS.values()))
-    weights = weights / weights.sum()
-
+    behaviors = list(BEHAVIOR_WEIGHTS)
+    weights = np.asarray(list(BEHAVIOR_WEIGHTS.values()), dtype=float)
+    weights /= weights.sum()
     lot_ids = [f"LOT_{i:02d}" for i in range(1, n_lots + 1)]
+    cfg = SYNTHETIC_DATA_CONFIG
 
-    # Baseline "typical" value per parameter (rough, illustrative magnitudes)
-    baseline = {
-        "Iddq": 10.0,          # uA
-        "Leakage": 8.0,        # uA
-        "PropagationDelay": 12.0,  # ns
-        "Icc": 25.0,           # mA
-        "Vth": 2.0,            # V
-        "RdsOn": 45.0,         # mOhm
-    }
+    # Shared lot characteristics induce modest within-lot covariance.
+    lot_effects = {}
+    for lot_id in lot_ids:
+        lot_rng = _lot_rng(seed, lot_id)
+        lot_effects[lot_id] = {
+            "baseline": lot_rng.normal(0, cfg["lot_baseline_std"]),
+            "degradation": lot_rng.normal(0, cfg["lot_degradation_std"]),
+            "process": lot_rng.normal(0, cfg["lot_process_std"]),
+            "defect_propensity": lot_rng.normal(0, 0.12),
+        }
 
     rows = []
     for i in range(n_components):
-        comp_id = f"C{i+1:04d}"
-        lot_id = rng.choice(lot_ids)
-        device_type = rng.choice(device_types)
-        temperature = rng.choice(temperatures)
-        behavior = rng.choice(behaviors, p=weights)
-
-        # Lot-level shift: each lot has a small systematic offset so that
-        # lot-normalization (z-scores) actually matters.
-        lot_seed = abs(hash(lot_id)) % (2**32)
-        lot_rng = np.random.default_rng(lot_seed)
-        lot_offset = lot_rng.normal(1.0, 0.03)
-
+        lot_id = str(rng.choice(lot_ids))
+        lot = lot_effects[lot_id]
+        behavior = str(rng.choice(behaviors, p=weights))
         row = {
-            "Component_ID": comp_id,
+            "Component_ID": f"C{i + 1:04d}",
             "Lot_ID": lot_id,
-            "Device_Type": device_type,
-            "Temperature": temperature,
-            "True_Behavior": behavior,   # kept for eval/debug only, NOT a feature
+            "Device_Type": rng.choice(device_types),
+            "Temperature": rng.choice(temperatures),
+            "True_Behavior": behavior,
             "Data_Source": "SYNTHETIC",
         }
 
-        for p in PARAMETERS:
-            base = baseline[p.name] * lot_offset * rng.uniform(0.9, 1.1)
-            traj = _trajectory(base, behavior, rng)
-            for tp in TIMEPOINTS:
-                row[f"{p.name}_{tp}h"] = round(traj[tp], 4)
+        # Common component health affects parameters together, with independent
+        # parameter terms preserving realistic imperfect correlation.
+        quality = rng.normal(0, 1)
+        degradation = np.exp(
+            cfg["component_degradation_std"] * quality + lot["degradation"]
+        )
+        component_baseline = rng.normal(0, cfg["component_baseline_std"])
+        component_process = rng.normal(0, cfg["component_process_std"])
+        rho = cfg["temporal_process_rho"]
+        temporal_process = np.empty(len(TIMEPOINTS), dtype=float)
+        temporal_process[0] = rng.normal(0, cfg["temporal_process_std"])
+        for j in range(1, len(TIMEPOINTS)):
+            temporal_process[j] = (
+                rho * temporal_process[j - 1]
+                + rng.normal(0, cfg["temporal_process_std"] * np.sqrt(1 - rho**2))
+            )
 
+        for param in PARAMETERS:
+            pname = param.name
+            baseline = BASELINES.get(pname, 1.0)
+            param_quality = rng.normal(0, 0.65)
+            param_base = baseline * np.exp(
+                lot["baseline"] + component_baseline + 0.025 * param_quality
+            )
+            tendency = degradation * np.exp(0.15 * param_quality + lot["defect_propensity"])
+            sensitivity = cfg["parameter_sensitivity"].get(pname, 1.0)
+            drift = _drift_profile(behavior, rng, tendency) * sensitivity
+            if behavior == "high_initial_stable":
+                param_base *= rng.uniform(1.35, 1.80)
+
+            # Each parameter has an independent temporal process/noise component,
+            # while sharing a smaller common process deviation with its peers.
+            param_temporal = np.empty(len(TIMEPOINTS), dtype=float)
+            param_temporal[0] = rng.normal(0, 0.003)
+            for j in range(1, len(TIMEPOINTS)):
+                param_temporal[j] = 0.55 * param_temporal[j - 1] + rng.normal(0, 0.0025)
+            process = lot["process"] + component_process + temporal_process + param_temporal
+            noise_frac = cfg["measurement_noise_frac"].get(pname, 0.015)
+            measurement = rng.normal(0, noise_frac, len(TIMEPOINTS))
+            direction = 1.0 if param.degrades_upward else -1.0
+            values = param_base * (1 + direction * drift + process + measurement)
+
+            # Static-limit escape is intended to show relative drift below an
+            # explicitly configured absolute ceiling, when there is room to do so.
+            limit = param.absolute_safety_limit
+            if behavior == "static_limit_escape" and limit is not None and limit > param_base:
+                max_value = float(np.max(values))
+                # Preserve a feasible positive drift even when the limit is
+                # only slightly above this component's initial value.
+                ceiling = max(limit * 0.98, (param_base + limit) / 2)
+                if max_value > ceiling:
+                    values = param_base + (values - param_base) * (
+                        (ceiling - param_base) / (max_value - param_base)
+                    )
+
+            for tp, value in zip(TIMEPOINTS, values):
+                row[f"{pname}_{tp}h"] = round(float(max(value, np.finfo(float).tiny)), 4)
         rows.append(row)
 
-    df = pd.DataFrame(rows)
-    return df
+    return pd.DataFrame(rows)
 
 
 if __name__ == "__main__":
-    df = generate_synthetic_dataset(n_components=300)
-    print(df.shape)
-    print(df.head())
-    print(df["True_Behavior"].value_counts())
+    dataset = generate_synthetic_dataset(n_components=300)
+    print(dataset.shape)
+    print(dataset.head())
+    print(dataset["True_Behavior"].value_counts())
