@@ -1,4 +1,10 @@
-"""Hierarchical synthetic ESS data generator for development and testing."""
+"""Hierarchical longitudinal ESS data generator for development and testing.
+
+Initial device spread is positive/skewed, lot and component effects are
+separate, and each behavior draws random interval slopes at the four readouts.
+Persistent AR process variation and smaller tester/readout plus measurement
+effects are then added to the latent piecewise trajectory.
+"""
 
 import hashlib
 
@@ -65,31 +71,77 @@ def _sample_behavior(rng, health, cfg):
     return str(rng.choice(candidates, p=probabilities))
 
 
-def _drift_profile(behavior, rng, tendency, latent_severity_range=None):
-    """Return nonnegative relative drift at the four configured timepoints."""
-    t = np.asarray(TIMEPOINTS, dtype=float) / max(TIMEPOINTS)
+def _segment_increments(total, weights, rng, late_acceleration, log_slope_std):
+    """Split total relative drift into random positive piecewise increments."""
+    weights = np.asarray(weights, dtype=float)
+    acceleration = np.ones(len(weights), dtype=float)
+    if len(acceleration) > 1:
+        acceleration[-1] = max(float(late_acceleration), 0.05)
+    random_slopes = rng.lognormal(-0.5 * log_slope_std**2, log_slope_std, len(weights))
+    weighted_slopes = weights * acceleration * random_slopes
+    return float(total) * weighted_slopes / weighted_slopes.sum()
+
+
+def _cumulative_profile(increments):
+    """Convert the three readout-interval changes to four device readouts."""
+    return np.concatenate(([0.0], np.cumsum(increments)))
+
+
+def _drift_profile(
+    behavior,
+    rng,
+    tendency,
+    latent_severity_range=None,
+    relative_drift_threshold=None,
+    late_acceleration=1.0,
+    slope_log_std=0.28,
+):
+    """Draw a component-specific piecewise relative drift path at readout times."""
+    times = np.asarray(TIMEPOINTS, dtype=float)
+    durations = np.diff(times)
     if behavior == "normal":
         end = rng.uniform(0.02, 0.06) * np.clip(tendency, 0.5, 1.7)
-        exponent = rng.uniform(0.85, 1.35)
-        return end * t**exponent + rng.normal(0, 0.002, len(t)) * t
+        increments = _segment_increments(
+            end, durations / durations.sum(), rng, 1.0, slope_log_std
+        )
+        return _cumulative_profile(increments)
     if behavior == "gradual_degradation":
         end = rng.uniform(0.35, 0.70) * np.clip(tendency, 0.65, 1.45)
-        return end * t**rng.uniform(1.15, 1.65)
+        early = end * rng.uniform(0.04, 0.15)
+        later = _segment_increments(
+            end - early, (0.44, 0.56), rng, late_acceleration, slope_log_std
+        )
+        return _cumulative_profile(np.concatenate(([early], later)))
     if behavior == "abrupt_degradation":
-        onset = rng.uniform(45.0, 105.0)
+        onset = rng.uniform(times[1], times[-1] - 24.0)
         end = rng.uniform(0.50, 1.20) * np.clip(tendency, 0.65, 1.45)
-        progress = np.clip((np.asarray(TIMEPOINTS, dtype=float) - onset) / (168.0 - onset), 0, 1)
-        return end * progress**rng.uniform(0.75, 1.25)
+        progress = np.clip((times - onset) / (times[-1] - onset), 0, 1)
+        raw_profile = end * progress**rng.uniform(0.75, 1.25)
+        raw_increments = np.diff(raw_profile)
+        weights = raw_increments / max(raw_increments.sum(), np.finfo(float).tiny)
+        increments = _segment_increments(
+            end, weights, rng, late_acceleration, slope_log_std
+        )
+        return _cumulative_profile(increments)
     if behavior == "latent_defect":
-        early = rng.uniform(0.025, 0.085) * np.clip(tendency, 0.7, 1.4)
+        early = rng.uniform(0.005, 0.025) * np.clip(tendency, 0.7, 1.4)
         severity_range = latent_severity_range or (0.50, 1.05)
         late = rng.uniform(*severity_range) * np.clip(tendency, 0.7, 1.4)
-        return early * t + late * t**rng.uniform(1.8, 2.5)
+        later = _segment_increments(
+            late, (0.38, 0.62), rng, late_acceleration, slope_log_std
+        )
+        return _cumulative_profile(np.concatenate(([early], later)))
     if behavior == "static_limit_escape":
-        end = rng.uniform(0.80, 1.40) * np.clip(tendency, 0.7, 1.35)
-        return end * t**rng.uniform(0.9, 1.35)
+        end = relative_drift_threshold * rng.uniform(0.75, 1.35) * np.clip(
+            tendency, 0.7, 1.35
+        )
+        early = min(rng.uniform(0.0, 0.025) * np.clip(tendency, 0.7, 1.35), end * 0.20)
+        later = _segment_increments(
+            end - early, (0.40, 0.60), rng, late_acceleration, slope_log_std
+        )
+        return _cumulative_profile(np.concatenate(([early], later)))
     if behavior == "high_initial_stable":
-        return np.zeros(len(t), dtype=float)
+        return np.zeros(len(times), dtype=float)
     raise ValueError(behavior)
 
 
@@ -122,6 +174,21 @@ def generate_synthetic_dataset(
             "defect_propensity": lot_rng.normal(0, 0.12),
         }
 
+    # A small readout/tester calibration path is shared across devices for
+    # each parameter, as a real test system can shift between measurement runs.
+    tester_offsets = {}
+    for param in PARAMETERS:
+        offsets = np.empty(len(TIMEPOINTS), dtype=float)
+        tester_rho = cfg["tester_readout_rho"]
+        tester_std = cfg["tester_readout_offset_std"]
+        offsets[0] = rng.normal(0, tester_std)
+        for j in range(1, len(TIMEPOINTS)):
+            offsets[j] = (
+                tester_rho * offsets[j - 1]
+                + rng.normal(0, tester_std * np.sqrt(1 - tester_rho**2))
+            )
+        tester_offsets[param.name] = offsets
+
     rows = []
     for i in range(n_components):
         lot_id = str(rng.choice(lot_ids))
@@ -153,8 +220,8 @@ def generate_synthetic_dataset(
             "Data_Source": "SYNTHETIC",
         }
 
-        # Retain an independent component degradation effect in addition to
-        # health, so nominally similar components can still age differently.
+        # Inter-device susceptibility and an independent random slope both
+        # affect aging; neither is a deterministic encoding of the behavior.
         quality = rng.normal(0, 1)
         degradation = np.exp(
             cfg["component_degradation_std"] * quality + lot["degradation"]
@@ -174,11 +241,15 @@ def generate_synthetic_dataset(
             pname = param.name
             baseline = BASELINES.get(pname, 1.0)
             param_quality = rng.normal(0, 0.65)
+            baseline_cv = cfg["parameter_baseline_gamma_cv"].get(pname, 0.04)
+            gamma_shape = 1.0 / baseline_cv**2
+            gamma_scale = baseline_cv**2
+            positive_skew = rng.gamma(gamma_shape, gamma_scale)
             param_health = 0.78 * health + rng.normal(0, 0.55)
             early_sensitivity = cfg["parameter_early_sensitivity"].get(pname, 1.0)
             baseline_sensitivity = cfg["parameter_baseline_sensitivity"].get(pname, 1.0)
             direction = 1.0 if param.degrades_upward else -1.0
-            param_base = baseline * np.exp(
+            param_base = baseline * positive_skew * np.exp(
                 lot["baseline"]
                 + component_baseline
                 + 0.025 * param_quality
@@ -197,8 +268,15 @@ def generate_synthetic_dataset(
                 / max(cfg["abrupt_early_warning_range"])
             )
             sensitivity = cfg["parameter_sensitivity"].get(pname, 1.0)
+            late_acceleration = cfg["parameter_late_acceleration"].get(pname, 1.0)
             drift = _drift_profile(
-                behavior, rng, tendency, latent_severity_range=latent_severity_range
+                behavior,
+                rng,
+                tendency,
+                latent_severity_range=latent_severity_range,
+                relative_drift_threshold=param.relative_drift_threshold,
+                late_acceleration=late_acceleration,
+                slope_log_std=cfg["segment_slope_log_std"],
             ) * sensitivity
             # Susceptibility leaves a small early footprint which persists
             # somewhat over time; independent profile/noise terms mean that
@@ -216,12 +294,22 @@ def generate_synthetic_dataset(
                 param_base *= rng.uniform(1.35, 1.80)
 
             # Each parameter has an independent temporal process/noise component,
-            # while sharing a smaller common process deviation with its peers.
+            # with parameter-specific persistence and a smaller shared component.
             param_temporal = np.empty(len(TIMEPOINTS), dtype=float)
+            param_rho = cfg["parameter_temporal_rho"].get(pname, 0.55)
             param_temporal[0] = rng.normal(0, 0.003)
             for j in range(1, len(TIMEPOINTS)):
-                param_temporal[j] = 0.55 * param_temporal[j - 1] + rng.normal(0, 0.0025)
-            process = lot["process"] + component_process + temporal_process + param_temporal
+                param_temporal[j] = (
+                    param_rho * param_temporal[j - 1]
+                    + rng.normal(0, 0.0025 * np.sqrt(1 - param_rho**2))
+                )
+            process = (
+                lot["process"]
+                + component_process
+                + temporal_process
+                + param_temporal
+                + tester_offsets[pname]
+            )
             noise_frac = cfg["measurement_noise_frac"].get(pname, 0.015)
             measurement = rng.normal(0, noise_frac, len(TIMEPOINTS))
             values = param_base * (1 + direction * drift + process + measurement)
