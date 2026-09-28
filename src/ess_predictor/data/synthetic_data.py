@@ -30,6 +30,18 @@ BASELINES = {
     "RdsOn": 45.0,
 }
 
+# More susceptible latent conditions modestly increase the odds of degradation
+# classes. High-initial-stable is sampled separately so its baseline level does
+# not imply a latent degradation tendency.
+_BEHAVIOR_HEALTH_LOADINGS = {
+    "normal": -0.20,
+    "gradual_degradation": 0.45,
+    "abrupt_degradation": 0.35,
+    "high_initial_stable": 0.0,
+    "latent_defect": 0.55,
+    "static_limit_escape": 0.40,
+}
+
 
 def _lot_rng(seed, lot_id):
     """Make lot-specific randomness stable across processes and Python runs."""
@@ -38,7 +50,22 @@ def _lot_rng(seed, lot_id):
     return np.random.default_rng(lot_seed)
 
 
-def _drift_profile(behavior, rng, tendency):
+def _sample_behavior(rng, health, cfg):
+    """Sample a behavior with weak dependence on latent health/susceptibility."""
+    high_initial_weight = BEHAVIOR_WEIGHTS["high_initial_stable"]
+    if rng.random() < high_initial_weight:
+        return "high_initial_stable"
+
+    candidates = [name for name in BEHAVIOR_WEIGHTS if name != "high_initial_stable"]
+    base = np.asarray([BEHAVIOR_WEIGHTS[name] for name in candidates], dtype=float)
+    loadings = np.asarray([_BEHAVIOR_HEALTH_LOADINGS[name] for name in candidates])
+    logits = np.log(base) + cfg["behavior_health_logit_scale"] * health * loadings
+    probabilities = np.exp(logits - np.max(logits))
+    probabilities /= probabilities.sum()
+    return str(rng.choice(candidates, p=probabilities))
+
+
+def _drift_profile(behavior, rng, tendency, latent_severity_range=None):
     """Return nonnegative relative drift at the four configured timepoints."""
     t = np.asarray(TIMEPOINTS, dtype=float) / max(TIMEPOINTS)
     if behavior == "normal":
@@ -55,7 +82,8 @@ def _drift_profile(behavior, rng, tendency):
         return end * progress**rng.uniform(0.75, 1.25)
     if behavior == "latent_defect":
         early = rng.uniform(0.025, 0.085) * np.clip(tendency, 0.7, 1.4)
-        late = rng.uniform(0.50, 1.05) * np.clip(tendency, 0.7, 1.4)
+        severity_range = latent_severity_range or (0.50, 1.05)
+        late = rng.uniform(*severity_range) * np.clip(tendency, 0.7, 1.4)
         return early * t + late * t**rng.uniform(1.8, 2.5)
     if behavior == "static_limit_escape":
         end = rng.uniform(0.80, 1.40) * np.clip(tendency, 0.7, 1.35)
@@ -79,9 +107,6 @@ def generate_synthetic_dataset(
         raise ValueError("device_types and temperatures must be nonempty")
 
     rng = np.random.default_rng(seed)
-    behaviors = list(BEHAVIOR_WEIGHTS)
-    weights = np.asarray(list(BEHAVIOR_WEIGHTS.values()), dtype=float)
-    weights /= weights.sum()
     lot_ids = [f"LOT_{i:02d}" for i in range(1, n_lots + 1)]
     cfg = SYNTHETIC_DATA_CONFIG
 
@@ -92,6 +117,7 @@ def generate_synthetic_dataset(
         lot_effects[lot_id] = {
             "baseline": lot_rng.normal(0, cfg["lot_baseline_std"]),
             "degradation": lot_rng.normal(0, cfg["lot_degradation_std"]),
+            "health": lot_rng.normal(0, cfg["lot_health_std"]),
             "process": lot_rng.normal(0, cfg["lot_process_std"]),
             "defect_propensity": lot_rng.normal(0, 0.12),
         }
@@ -100,7 +126,24 @@ def generate_synthetic_dataset(
     for i in range(n_components):
         lot_id = str(rng.choice(lot_ids))
         lot = lot_effects[lot_id]
-        behavior = str(rng.choice(behaviors, p=weights))
+        # A shared lot/component condition weakly affects class likelihood,
+        # early observations, and later degradation. Independent draws below
+        # prevent this hidden state from becoming a deterministic label.
+        health = lot["health"] + rng.normal(0, cfg["component_health_std"])
+        behavior = _sample_behavior(rng, health, cfg)
+        latent_severity_range = None
+        if behavior == "latent_defect":
+            severity_names = list(cfg["latent_severity_probabilities"])
+            severity_probabilities = list(cfg["latent_severity_probabilities"].values())
+            latent_severity = str(rng.choice(severity_names, p=severity_probabilities))
+            latent_severity_range = cfg["latent_late_drift_ranges"][latent_severity]
+
+        abrupt_warning = 0.0
+        if behavior == "abrupt_degradation":
+            if rng.random() < cfg["abrupt_early_warning_probability"]:
+                abrupt_warning = rng.uniform(*cfg["abrupt_early_warning_range"])
+            else:
+                abrupt_warning = rng.uniform(*cfg["abrupt_quiet_warning_range"])
         row = {
             "Component_ID": f"C{i + 1:04d}",
             "Lot_ID": lot_id,
@@ -110,8 +153,8 @@ def generate_synthetic_dataset(
             "Data_Source": "SYNTHETIC",
         }
 
-        # Common component health affects parameters together, with independent
-        # parameter terms preserving realistic imperfect correlation.
+        # Retain an independent component degradation effect in addition to
+        # health, so nominally similar components can still age differently.
         quality = rng.normal(0, 1)
         degradation = np.exp(
             cfg["component_degradation_std"] * quality + lot["degradation"]
@@ -131,12 +174,44 @@ def generate_synthetic_dataset(
             pname = param.name
             baseline = BASELINES.get(pname, 1.0)
             param_quality = rng.normal(0, 0.65)
+            param_health = 0.78 * health + rng.normal(0, 0.55)
+            early_sensitivity = cfg["parameter_early_sensitivity"].get(pname, 1.0)
+            baseline_sensitivity = cfg["parameter_baseline_sensitivity"].get(pname, 1.0)
+            direction = 1.0 if param.degrades_upward else -1.0
             param_base = baseline * np.exp(
-                lot["baseline"] + component_baseline + 0.025 * param_quality
+                lot["baseline"]
+                + component_baseline
+                + 0.025 * param_quality
+                + direction
+                * cfg["early_health_baseline_frac"]
+                * baseline_sensitivity
+                * param_health
             )
-            tendency = degradation * np.exp(0.15 * param_quality + lot["defect_propensity"])
+            tendency = degradation * np.exp(
+                cfg["future_health_sensitivity"] * param_health
+                + 0.15 * param_quality
+                + lot["defect_propensity"]
+                + rng.normal(0, cfg["future_shock_std"])
+                + cfg["abrupt_future_warning_sensitivity"]
+                * abrupt_warning
+                / max(cfg["abrupt_early_warning_range"])
+            )
             sensitivity = cfg["parameter_sensitivity"].get(pname, 1.0)
-            drift = _drift_profile(behavior, rng, tendency) * sensitivity
+            drift = _drift_profile(
+                behavior, rng, tendency, latent_severity_range=latent_severity_range
+            ) * sensitivity
+            # Susceptibility leaves a small early footprint which persists
+            # somewhat over time; independent profile/noise terms mean that
+            # early values remain only a noisy clue to the eventual severity.
+            early_profile = np.asarray([0.0, 1.0, 1.20, 1.35])
+            drift += (
+                cfg["early_health_drift_frac"]
+                * early_sensitivity
+                * param_health
+                * early_profile
+            )
+            if behavior == "abrupt_degradation":
+                drift += abrupt_warning * early_sensitivity * early_profile
             if behavior == "high_initial_stable":
                 param_base *= rng.uniform(1.35, 1.80)
 
@@ -149,7 +224,6 @@ def generate_synthetic_dataset(
             process = lot["process"] + component_process + temporal_process + param_temporal
             noise_frac = cfg["measurement_noise_frac"].get(pname, 0.015)
             measurement = rng.normal(0, noise_frac, len(TIMEPOINTS))
-            direction = 1.0 if param.degrades_upward else -1.0
             values = param_base * (1 + direction * drift + process + measurement)
 
             # Static-limit escape is intended to show relative drift below an
