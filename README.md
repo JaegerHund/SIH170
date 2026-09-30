@@ -41,6 +41,7 @@ ess-predictor/
 │           └── plots.py            # all required engineering plots
 ├── scripts/
 │   └── run_demo.py             # end-to-end demo you actually run
+├── app.py                      # read-only Streamlit dashboard for saved CSVs
 ├── tests/
 │   └── test_smoke.py           # fast sanity check — run after any edit
 ├── plots/                      # generated figures land here (gitignored)
@@ -76,6 +77,24 @@ python scripts/run_demo.py
 Outputs always land in the project root's `plots/`, `outputs/`, and
 `models_store/` folders, regardless of which directory you run the
 command from.
+
+## Open the CSV dashboard
+
+The dashboard displays the saved synthetic dataset, component-level actual
+and predicted 168h values, error metrics, per-lot validation scores, and
+SAFE / REVIEW / REJECT details. It does not train a model or make new
+predictions. Generate or refresh the CSVs first, then install the optional
+dashboard dependency and launch it:
+
+```bash
+python scripts/run_demo.py
+pip install -e ".[app]"
+streamlit run app.py
+```
+
+The default forecast view uses components held out from point-model fitting
+and selection. The separate LOLO view is labeled as model-selection
+validation because those lot scores are also used to select the model.
 
 ## Run the smoke test after editing anything
 

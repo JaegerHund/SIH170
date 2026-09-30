@@ -1,12 +1,7 @@
-"""Hierarchical longitudinal ESS data generator for development and testing.
-
-Initial device spread is positive/skewed, lot and component effects are
-separate, and each behavior draws random interval slopes at the four readouts.
-Persistent AR process variation and smaller tester/readout plus measurement
-effects are then added to the latent piecewise trajectory.
-"""
+"""Generate synthetic ESS measurements with lot and device variation."""
 
 import hashlib
+from copy import deepcopy
 
 import numpy as np
 import pandas as pd
@@ -15,17 +10,9 @@ from ess_predictor.config import (
     PARAMETERS,
     RANDOM_STATE,
     SYNTHETIC_DATA_CONFIG,
+    SYNTHETIC_DATA_PROFILES,
     TIMEPOINTS,
 )
-
-BEHAVIOR_WEIGHTS = {
-    "normal": 0.55,
-    "gradual_degradation": 0.15,
-    "abrupt_degradation": 0.08,
-    "high_initial_stable": 0.10,
-    "latent_defect": 0.07,
-    "static_limit_escape": 0.05,
-}
 
 BASELINES = {
     "Iddq": 10.0,
@@ -36,9 +23,8 @@ BASELINES = {
     "RdsOn": 45.0,
 }
 
-# More susceptible latent conditions modestly increase the odds of degradation
-# classes. High-initial-stable is sampled separately so its baseline level does
-# not imply a latent degradation tendency.
+# Latent health shifts degradation odds. High-initial-stable is sampled apart
+# from health so its higher baseline does not imply faster aging.
 _BEHAVIOR_HEALTH_LOADINGS = {
     "normal": -0.20,
     "gradual_degradation": 0.45,
@@ -50,20 +36,20 @@ _BEHAVIOR_HEALTH_LOADINGS = {
 
 
 def _lot_rng(seed, lot_id):
-    """Make lot-specific randomness stable across processes and Python runs."""
+    """Create a reproducible random stream for one lot."""
     token = f"{int(seed)}:{lot_id}".encode("utf-8")
     lot_seed = int.from_bytes(hashlib.sha256(token).digest()[:8], "big")
     return np.random.default_rng(lot_seed)
 
 
-def _sample_behavior(rng, health, cfg):
-    """Sample a behavior with weak dependence on latent health/susceptibility."""
-    high_initial_weight = BEHAVIOR_WEIGHTS["high_initial_stable"]
+def _sample_behavior(rng, health, cfg, behavior_weights):
+    """Choose a behavior, with a small adjustment for latent health."""
+    high_initial_weight = behavior_weights["high_initial_stable"]
     if rng.random() < high_initial_weight:
         return "high_initial_stable"
 
-    candidates = [name for name in BEHAVIOR_WEIGHTS if name != "high_initial_stable"]
-    base = np.asarray([BEHAVIOR_WEIGHTS[name] for name in candidates], dtype=float)
+    candidates = [name for name in behavior_weights if name != "high_initial_stable"]
+    base = np.asarray([behavior_weights[name] for name in candidates], dtype=float)
     loadings = np.asarray([_BEHAVIOR_HEALTH_LOADINGS[name] for name in candidates])
     logits = np.log(base) + cfg["behavior_health_logit_scale"] * health * loadings
     probabilities = np.exp(logits - np.max(logits))
@@ -151,8 +137,16 @@ def generate_synthetic_dataset(
     device_types=("DeviceA", "DeviceB"),
     temperatures=(125,),
     seed: int = RANDOM_STATE,
+    profile: str = "balanced",
 ) -> pd.DataFrame:
-    """Return one row per component with the established wide measurement schema."""
+    """Generate reproducible synthetic measurements for a named scenario.
+
+    ``balanced`` preserves the historical generator distribution. Use
+    ``easy_demo`` or ``stress`` explicitly for alternate demo scenarios.
+    """
+    if profile not in SYNTHETIC_DATA_PROFILES:
+        choices = ", ".join(SYNTHETIC_DATA_PROFILES)
+        raise ValueError(f"Unknown synthetic profile {profile!r}; choose from: {choices}")
     if n_components < 0 or n_lots < 1:
         raise ValueError("n_components must be nonnegative and n_lots must be positive")
     if n_components and (not device_types or not temperatures):
@@ -160,9 +154,19 @@ def generate_synthetic_dataset(
 
     rng = np.random.default_rng(seed)
     lot_ids = [f"LOT_{i:02d}" for i in range(1, n_lots + 1)]
-    cfg = SYNTHETIC_DATA_CONFIG
+    profile_cfg = SYNTHETIC_DATA_PROFILES[profile]
+    behavior_weights = profile_cfg["behavior_weights"]
+    if (
+        set(behavior_weights) != set(_BEHAVIOR_HEALTH_LOADINGS)
+        or any(not np.isfinite(weight) or weight <= 0 for weight in behavior_weights.values())
+        or not np.isclose(sum(behavior_weights.values()), 1.0)
+    ):
+        raise ValueError(f"Synthetic profile {profile!r} has invalid behavior weights.")
+    cfg = deepcopy(SYNTHETIC_DATA_CONFIG)
+    cfg.update(deepcopy(profile_cfg["config_overrides"]))
+    process_noise_scale = cfg["process_noise_scale"]
 
-    # Shared lot characteristics induce modest within-lot covariance.
+    # Lot effects give components from the same lot some shared variation.
     lot_effects = {}
     for lot_id in lot_ids:
         lot_rng = _lot_rng(seed, lot_id)
@@ -170,17 +174,16 @@ def generate_synthetic_dataset(
             "baseline": lot_rng.normal(0, cfg["lot_baseline_std"]),
             "degradation": lot_rng.normal(0, cfg["lot_degradation_std"]),
             "health": lot_rng.normal(0, cfg["lot_health_std"]),
-            "process": lot_rng.normal(0, cfg["lot_process_std"]),
+            "process": lot_rng.normal(0, cfg["lot_process_std"] * process_noise_scale),
             "defect_propensity": lot_rng.normal(0, 0.12),
         }
 
-    # A small readout/tester calibration path is shared across devices for
-    # each parameter, as a real test system can shift between measurement runs.
+    # A shared offset lets the simulated tester drift between readouts.
     tester_offsets = {}
     for param in PARAMETERS:
         offsets = np.empty(len(TIMEPOINTS), dtype=float)
         tester_rho = cfg["tester_readout_rho"]
-        tester_std = cfg["tester_readout_offset_std"]
+        tester_std = cfg["tester_readout_offset_std"] * process_noise_scale
         offsets[0] = rng.normal(0, tester_std)
         for j in range(1, len(TIMEPOINTS)):
             offsets[j] = (
@@ -193,11 +196,10 @@ def generate_synthetic_dataset(
     for i in range(n_components):
         lot_id = str(rng.choice(lot_ids))
         lot = lot_effects[lot_id]
-        # A shared lot/component condition weakly affects class likelihood,
-        # early observations, and later degradation. Independent draws below
-        # prevent this hidden state from becoming a deterministic label.
+        # Health affects behavior and aging, but independent noise keeps it
+        # from determining the eventual measurements by itself.
         health = lot["health"] + rng.normal(0, cfg["component_health_std"])
-        behavior = _sample_behavior(rng, health, cfg)
+        behavior = _sample_behavior(rng, health, cfg, behavior_weights)
         latent_severity_range = None
         if behavior == "latent_defect":
             severity_names = list(cfg["latent_severity_probabilities"])
@@ -218,23 +220,32 @@ def generate_synthetic_dataset(
             "Temperature": rng.choice(temperatures),
             "True_Behavior": behavior,
             "Data_Source": "SYNTHETIC",
+            "Synthetic_Profile": profile,
         }
 
-        # Inter-device susceptibility and an independent random slope both
-        # affect aging; neither is a deterministic encoding of the behavior.
+        # Vary each component's susceptibility and aging rate independently.
         quality = rng.normal(0, 1)
         degradation = np.exp(
             cfg["component_degradation_std"] * quality + lot["degradation"]
         )
         component_baseline = rng.normal(0, cfg["component_baseline_std"])
-        component_process = rng.normal(0, cfg["component_process_std"])
+        component_process = rng.normal(
+            0, cfg["component_process_std"] * process_noise_scale
+        )
         rho = cfg["temporal_process_rho"]
         temporal_process = np.empty(len(TIMEPOINTS), dtype=float)
-        temporal_process[0] = rng.normal(0, cfg["temporal_process_std"])
+        temporal_process[0] = rng.normal(
+            0, cfg["temporal_process_std"] * process_noise_scale
+        )
         for j in range(1, len(TIMEPOINTS)):
             temporal_process[j] = (
                 rho * temporal_process[j - 1]
-                + rng.normal(0, cfg["temporal_process_std"] * np.sqrt(1 - rho**2))
+                + rng.normal(
+                    0,
+                    cfg["temporal_process_std"]
+                    * process_noise_scale
+                    * np.sqrt(1 - rho**2),
+                )
             )
 
         for param in PARAMETERS:
@@ -277,10 +288,9 @@ def generate_synthetic_dataset(
                 relative_drift_threshold=param.relative_drift_threshold,
                 late_acceleration=late_acceleration,
                 slope_log_std=cfg["segment_slope_log_std"],
-            ) * sensitivity
-            # Susceptibility leaves a small early footprint which persists
-            # somewhat over time; independent profile/noise terms mean that
-            # early values remain only a noisy clue to the eventual severity.
+            ) * sensitivity * cfg["degradation_scale"]
+            # Let health affect the early readings slightly; the later drift
+            # still includes independent variation.
             early_profile = np.asarray([0.0, 1.0, 1.20, 1.35])
             drift += (
                 cfg["early_health_drift_frac"]
@@ -293,15 +303,17 @@ def generate_synthetic_dataset(
             if behavior == "high_initial_stable":
                 param_base *= rng.uniform(1.35, 1.80)
 
-            # Each parameter has an independent temporal process/noise component,
-            # with parameter-specific persistence and a smaller shared component.
+            # Add parameter-specific process noise on top of the shared effects.
             param_temporal = np.empty(len(TIMEPOINTS), dtype=float)
             param_rho = cfg["parameter_temporal_rho"].get(pname, 0.55)
-            param_temporal[0] = rng.normal(0, 0.003)
+            param_temporal[0] = rng.normal(0, 0.003 * process_noise_scale)
             for j in range(1, len(TIMEPOINTS)):
                 param_temporal[j] = (
                     param_rho * param_temporal[j - 1]
-                    + rng.normal(0, 0.0025 * np.sqrt(1 - param_rho**2))
+                    + rng.normal(
+                        0,
+                        0.0025 * process_noise_scale * np.sqrt(1 - param_rho**2),
+                    )
                 )
             process = (
                 lot["process"]
@@ -311,16 +323,16 @@ def generate_synthetic_dataset(
                 + tester_offsets[pname]
             )
             noise_frac = cfg["measurement_noise_frac"].get(pname, 0.015)
-            measurement = rng.normal(0, noise_frac, len(TIMEPOINTS))
+            measurement = rng.normal(
+                0, noise_frac * cfg["measurement_noise_scale"], len(TIMEPOINTS)
+            )
             values = param_base * (1 + direction * drift + process + measurement)
 
-            # Static-limit escape is intended to show relative drift below an
-            # explicitly configured absolute ceiling, when there is room to do so.
+            # Keep some escape cases below the absolute limit when possible.
             limit = param.absolute_safety_limit
             if behavior == "static_limit_escape" and limit is not None and limit > param_base:
                 max_value = float(np.max(values))
-                # Preserve a feasible positive drift even when the limit is
-                # only slightly above this component's initial value.
+                # Keep the adjusted drift positive when the margin is small.
                 ceiling = max(limit * 0.98, (param_base + limit) / 2)
                 if max_value > ceiling:
                     values = param_base + (values - param_base) * (

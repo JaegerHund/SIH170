@@ -1,36 +1,11 @@
-"""
-safety.py
----------
-Safety-slope decision logic (spec section 8-9) and physics-plausibility
-checks (spec section 12).
-
-Decision logic overview
-------------------------
-For a component/parameter:
-  1. Compute Predicted_Relative_Drift = (Pred_168h - Value_0h) / |Value_0h|
-  2. Compare against ParameterConfig.relative_drift_threshold (T).
-  3. Also check absolute_safety_limit if configured.
-  4. Use the conformal prediction interval to decide confidence:
-       - if the interval is wide relative to the prediction -> REVIEW
-       - if the prediction clearly crosses T even in the best case -> REJECT
-       - if the prediction clearly stays under T even in the worst case
-         -> SAFE
-       - otherwise (threshold falls inside the interval, i.e. genuinely
-         ambiguous) -> REVIEW
-
-This directly implements "SAFE / REVIEW / REJECT rather than forcing
-every component into SAFE/REJECT" and "prioritize avoiding defective
-components escaping screening" -- REJECT is only assigned when there is
-positive evidence of exceeding threshold; genuine ambiguity always routes
-to REVIEW rather than defaulting to SAFE.
-"""
+"""Route predictions to SAFE, REVIEW, or REJECT using drift and limits."""
 
 from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
 
-from ess_predictor.config import ParameterConfig, DEFAULT_REVIEW_MARGIN_FRAC
+from ess_predictor.config import LOT_OUTLIER_REVIEW_Z_THRESHOLD, ParameterConfig
 
 
 @dataclass
@@ -58,7 +33,7 @@ def evaluate_safety(
     pred_high: float,
     param_cfg: ParameterConfig,
     lot_z_24h: Optional[float] = None,
-    z_score_flag_threshold: float = 3.0,
+    z_score_flag_threshold: float = LOT_OUTLIER_REVIEW_Z_THRESHOLD,
 ) -> SafetyDecision:
     """
     Produce a SAFE / REVIEW / REJECT decision for one parameter of one
@@ -74,40 +49,50 @@ def evaluate_safety(
 
     T = param_cfg.relative_drift_threshold
     margin = param_cfg.review_margin_frac * T
+    direction = 1.0 if param_cfg.degrades_upward else -1.0
+    risk_rel = direction * rel_drift
+    risk_bounds = sorted((direction * rel_drift_low, direction * rel_drift_high))
+    best_case_risk, worst_case_risk = risk_bounds
 
-    # Does the whole interval clear the threshold on the safe side?
-    worst_case_rel = max(rel_drift_low, rel_drift_high)  # "worst" = largest drift
-    best_case_rel = min(rel_drift_low, rel_drift_high)
-
-    crosses_abs_limit = False
+    reaches_abs_limit = False
+    confidently_over_abs_limit = False
     if param_cfg.absolute_safety_limit is not None:
-        crosses_abs_limit = pred_high >= param_cfg.absolute_safety_limit
-        if crosses_abs_limit:
+        reaches_abs_limit = max(pred_low, pred_high) >= param_cfg.absolute_safety_limit
+        confidently_over_abs_limit = min(pred_low, pred_high) >= param_cfg.absolute_safety_limit
+        if reaches_abs_limit:
             reasons.append(
                 f"Prediction interval reaches or exceeds absolute safety limit "
                 f"({param_cfg.absolute_safety_limit} {param_cfg.unit})."
             )
 
-    if worst_case_rel < (T - margin) and not crosses_abs_limit:
+    if worst_case_risk < (T - margin) and not reaches_abs_limit:
         decision = "SAFE"
         reasons.append(
-            f"Predicted relative drift ({rel_drift*100:.1f}%) and its full "
+            f"Predicted drift in the configured degradation direction "
+            f"({risk_rel*100:.1f}%) and its full "
             f"prediction interval stay comfortably below the {T*100:.0f}% "
             f"safety threshold."
         )
-    elif best_case_rel > (T + margin) or crosses_abs_limit:
+    elif best_case_risk > (T + margin) or confidently_over_abs_limit:
         decision = "REJECT"
-        reasons.append(
-            f"Predicted relative drift ({rel_drift*100:.1f}%) exceeds the "
-            f"{T*100:.0f}% safety threshold, including under the optimistic "
-            f"end of the prediction interval."
-        )
+        if confidently_over_abs_limit:
+            reasons.append(
+                f"The full prediction interval is at or above the absolute "
+                f"safety limit ({param_cfg.absolute_safety_limit} {param_cfg.unit})."
+            )
+        else:
+            reasons.append(
+                f"Predicted drift in the configured degradation direction "
+                f"({risk_rel*100:.1f}%) exceeds the {T*100:.0f}% safety "
+                f"threshold, including under the optimistic end of the interval."
+            )
     else:
         decision = "REVIEW"
         reasons.append(
-            f"Predicted relative drift ({rel_drift*100:.1f}%) is close to the "
+            f"Predicted drift in the configured degradation direction "
+            f"({risk_rel*100:.1f}%) is close to the "
             f"{T*100:.0f}% safety threshold, or the prediction interval "
-            f"[{rel_drift_low*100:.1f}%, {rel_drift_high*100:.1f}%] straddles "
+            f"[{risk_bounds[0]*100:.1f}%, {risk_bounds[1]*100:.1f}%] straddles "
             f"the threshold -- not enough confidence to decide automatically."
         )
 
@@ -135,8 +120,8 @@ def evaluate_safety(
 def overall_component_decision(param_decisions: dict) -> str:
     """
     Combine per-parameter SAFE/REVIEW/REJECT decisions into one overall
-    component decision. Conservative w.r.t. false negatives (spec section
-    21): REJECT dominates REVIEW dominates SAFE.
+    component decision. Any REJECT dominates, then any REVIEW keeps the
+    component out of SAFE so an unresolved parameter cannot silently pass.
     """
     decisions = set(d.decision for d in param_decisions.values())
     if "REJECT" in decisions:
@@ -146,28 +131,29 @@ def overall_component_decision(param_decisions: dict) -> str:
     return "SAFE"
 
 
-# ---------------------------------------------------------------------------
-# Safety-oriented evaluation metrics (spec section 8): treat "actually
-# exceeds threshold" (based on the TRUE 168h value) as the positive
-# ("defective") class, and evaluate the SAFE/REVIEW/REJECT classifier
-# (collapsing REVIEW+REJECT into "flagged", since the whole point of
-# REVIEW is that the component does NOT silently pass) as a detector.
-# ---------------------------------------------------------------------------
+# Label defects from true 168 h drift and any configured absolute limit.
 
 def safety_confusion_metrics(y_true_168h: np.ndarray, value_0h: np.ndarray,
-                              decisions: list, param_cfg: ParameterConfig):
+                              decisions: list, param_cfg: ParameterConfig,
+                              truth_param_cfg: Optional[ParameterConfig] = None):
     """
     y_true_168h, value_0h: arrays of true 168h values and 0h baselines.
     decisions: list of SafetyDecision.decision strings ("SAFE"/"REVIEW"/"REJECT")
     param_cfg: for the relative drift threshold defining ground-truth "defective".
 
-    A component is truly "defective" if its ACTUAL relative drift exceeds
-    the safety threshold. A false negative = truly defective component
-    that the system called SAFE (REVIEW is NOT a false negative, because
-    it does not clear the component for use without further scrutiny).
+    A component is truly defective if actual drift in the configured bad
+    direction exceeds the relative threshold or it exceeds a configured
+    absolute ceiling. The main confusion matrix treats REVIEW and REJECT as
+    flagged; a second matrix reports confident REJECT separately.
     """
+    y_true_168h = np.asarray(y_true_168h, dtype=float)
+    value_0h = np.asarray(value_0h, dtype=float)
     true_rel_drift = (y_true_168h - value_0h) / np.maximum(np.abs(value_0h), 1e-9)
-    true_defective = true_rel_drift > param_cfg.relative_drift_threshold
+    truth_cfg = truth_param_cfg or param_cfg
+    direction = 1.0 if truth_cfg.degrades_upward else -1.0
+    true_defective = direction * true_rel_drift > truth_cfg.relative_drift_threshold
+    if truth_cfg.absolute_safety_limit is not None:
+        true_defective |= y_true_168h >= truth_cfg.absolute_safety_limit
 
     decisions = np.array(decisions)
     predicted_safe = decisions == "SAFE"
@@ -185,21 +171,52 @@ def safety_confusion_metrics(y_true_168h: np.ndarray, value_0h: np.ndarray,
     precision = tp / (tp + fp) if (tp + fp) > 0 else np.nan
     fnr = fn / n_pos if n_pos > 0 else np.nan
     fpr = fp / n_neg if n_neg > 0 else np.nan
+    specificity = tn / n_neg if n_neg > 0 else np.nan
+
+    # A review routes the part for human scrutiny; it is not equivalent to a
+    # confident rejection. Report both operational definitions of a positive.
+    predicted_reject = decisions == "REJECT"
+    reject_tp = int(np.sum(true_defective & predicted_reject))
+    reject_fn = int(np.sum(true_defective & ~predicted_reject))
+    reject_tn = int(np.sum(~true_defective & ~predicted_reject))
+    reject_fp = int(np.sum(~true_defective & predicted_reject))
 
     return {
         "confusion_matrix": {"TP": tp, "FN": fn, "TN": tn, "FP": fp},
+        "TP": tp,
+        "FN": fn,
+        "TN": tn,
+        "FP": fp,
+        "reject_confusion_matrix": {
+            "TP": reject_tp, "FN": reject_fn, "TN": reject_tn, "FP": reject_fp,
+        },
+        "reject_TP": reject_tp,
+        "reject_FN": reject_fn,
+        "reject_TN": reject_tn,
+        "reject_FP": reject_fp,
         "recall_sensitivity": recall,
         "precision": precision,
         "false_negative_rate": fnr,
         "false_positive_rate": fpr,
+        "specificity": specificity,
+        "reject_precision": reject_tp / (reject_tp + reject_fp) if (reject_tp + reject_fp) else np.nan,
+        "reject_recall": reject_tp / n_pos if n_pos else np.nan,
+        "reject_false_positive_rate": reject_fp / n_neg if n_neg else np.nan,
+        "review_count": int(np.sum(decisions == "REVIEW")),
+        "reject_count": int(np.sum(predicted_reject)),
+        "relative_drift_threshold": param_cfg.relative_drift_threshold,
+        "ground_truth_relative_drift_threshold": truth_cfg.relative_drift_threshold,
+        "review_margin_frac": param_cfg.review_margin_frac,
+        "safe_relative_boundary": param_cfg.relative_drift_threshold * (1 - param_cfg.review_margin_frac),
+        "reject_relative_boundary": param_cfg.relative_drift_threshold * (1 + param_cfg.review_margin_frac),
+        "absolute_safety_limit": param_cfg.absolute_safety_limit,
+        "degradation_direction": "upward" if param_cfg.degrades_upward else "downward",
         "n_true_defective": int(n_pos),
         "n_true_ok": int(n_neg),
     }
 
 
-# ---------------------------------------------------------------------------
-# Physics/engineering plausibility check (spec section 12)
-# ---------------------------------------------------------------------------
+# Basic plausibility checks for predicted drift.
 
 def physics_plausibility_flags(value_0h: np.ndarray, value_24h: np.ndarray,
                                 pred_168h: np.ndarray, param_cfg: ParameterConfig):

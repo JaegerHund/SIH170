@@ -1,45 +1,61 @@
-"""
-pipeline.py
------------
-Orchestrates the full Module B pipeline (spec section 14):
-
-RAW DATA -> validation -> feature engineering -> lot normalization
-  -> early drift calc -> regression model -> predicted 168h
-  -> uncertainty estimation -> safety-threshold/slope comparison
-  -> SAFE/REVIEW/REJECT -> explainability report
-
-Trains one INDEPENDENT model per parameter (spec section 15, Approach A
-chosen as the initial implementation for interpretability/debuggability).
-"""
+"""Train and apply one 168 h regression model per parameter."""
 
 import os
 import pickle
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Dict, Optional, Union
 
 import numpy as np
 import pandas as pd
+from sklearn.model_selection import GroupShuffleSplit
 
-from ess_predictor.config import PARAMETERS, ParameterConfig, N_GROUP_FOLDS, CONFORMAL_ALPHA
+from ess_predictor.config import (
+    PARAMETERS,
+    ParameterConfig,
+    N_GROUP_FOLDS,
+    CONFORMAL_ALPHA,
+    RANDOM_STATE,
+    MIN_LOT_SIZE_FOR_STATS,
+)
 from ess_predictor.data.validation import validate_dataset, handle_missing_values
 from ess_predictor.features.engineering import build_feature_matrix, build_features_for_parameter
-from ess_predictor.models.zoo import build_model_zoo
-from ess_predictor.models.cross_validation import compare_models, select_best_model, CVResult
-from ess_predictor.uncertainty.conformal import fit_conformal, predict_interval, ConformalCalibration, low_confidence_flag
+from ess_predictor.models.zoo import (
+    QRF_MODEL_NAME,
+    build_model_zoo,
+    predict_qrf_quantiles,
+)
+from ess_predictor.models.cross_validation import (
+    compare_models,
+    select_best_model,
+    split_conformal_oof,
+    CVResult,
+)
+from ess_predictor.uncertainty.conformal import (
+    ConformalCalibration,
+    QuantileConformalCalibration,
+    fit_conformal,
+    fit_conformalized_quantiles,
+    predict_interval,
+    predict_quantile_intervals,
+)
 from ess_predictor.safety.decision import evaluate_safety, physics_plausibility_flags, safety_confusion_metrics
 from ess_predictor.explainability.explain import explain_prediction, global_feature_importance
 
 
 @dataclass
 class ParameterModelBundle:
-    """Everything needed to score a new component for one parameter."""
+    """Model and validation results for one parameter."""
     param_cfg: ParameterConfig
     best_model_name: str
     pipeline: object                 # fitted sklearn Pipeline
     cv_results: Dict[str, CVResult]
-    conformal: ConformalCalibration
+    conformal: Union[ConformalCalibration, QuantileConformalCalibration]
     feature_columns: list
     safety_metrics: dict
+    interval_comparison: dict = field(default_factory=dict)
+    explanation_reference: Optional[pd.Series] = None
+    lot_cv_results: Dict[str, CVResult] = field(default_factory=dict)
+    calibration_predictions: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 @dataclass
@@ -50,11 +66,7 @@ class TrainedSystem:
 
 def train_all_parameters(df: pd.DataFrame, n_folds: int = N_GROUP_FOLDS,
                           verbose: bool = True) -> TrainedSystem:
-    """
-    Run the full training pipeline for every usable parameter in the
-    dataset: validate -> build features -> compare models -> select best
-    -> calibrate conformal intervals -> compute safety metrics.
-    """
+    """Validate the data, select models, and fit intervals for each parameter."""
     report = validate_dataset(df)
     if verbose:
         print(report.summary())
@@ -78,58 +90,187 @@ def train_all_parameters(df: pd.DataFrame, n_folds: int = N_GROUP_FOLDS,
                 print(f"Skipping {p.name}: not enough distinct components to group-validate.")
             continue
 
-        zoo = build_model_zoo()
-        cv_results = compare_models(zoo, X, y, groups, n_folds=n_folds)
-        best_name = select_best_model(cv_results)
+        lot_ids = None
+        if "Lot_ID" in df.columns:
+            component_lots = (
+                df.drop_duplicates("Component_ID")
+                .set_index("Component_ID")["Lot_ID"]
+            )
+            lot_ids = groups.map(component_lots).reset_index(drop=True)
+
+        # Hold out components for conformal calibration.
+        if groups.nunique() >= 4:
+            split = GroupShuffleSplit(n_splits=1, test_size=0.20, random_state=RANDOM_STATE)
+            fit_idx, cal_idx = next(split.split(X, y, groups=groups))
+            assert set(groups.iloc[fit_idx]).isdisjoint(set(groups.iloc[cal_idx]))
+        else:
+            # With too few components, calibrate from out-of-fold residuals.
+            fit_idx = np.arange(len(X))
+            cal_idx = np.array([], dtype=int)
+        X_fit, y_fit, groups_fit = X.iloc[fit_idx], y.iloc[fit_idx], groups.iloc[fit_idx]
+        zoo = build_model_zoo(include_baselines=True)
+        cv_results = compare_models(zoo, X_fit, y_fit, groups_fit, n_folds=n_folds)
+        lot_cv_results = {}
+        if lot_ids is not None:
+            fit_lots = lot_ids.iloc[fit_idx].reset_index(drop=True)
+            if fit_lots.nunique() >= 2:
+                # Hold out one lot at a time; these scores select the model.
+                lot_cv_results = compare_models(
+                    zoo,
+                    X_fit,
+                    y_fit,
+                    fit_lots,
+                    n_folds=int(fit_lots.nunique()),
+                )
+        best_name = select_best_model(lot_cv_results or cv_results)
 
         if verbose:
-            print(f"[{p.name}] Model comparison (CV MAE {p.unit}):")
+            print(f"[{p.name}] Component-grouped CV MAE ({p.unit}):")
             for name, r in cv_results.items():
-                marker = "  <== selected" if name == best_name else ""
-                print(f"    {name:28s} MAE={r.mae:.4f}  RMSE={r.rmse:.4f}  R2={r.r2:.4f}{marker}")
+                marker = "  <== best by component CV" if name == best_name and not lot_cv_results else ""
+                print(
+                    f"    {name:28s} MAE={r.mae:.4f}  RMSE={r.rmse:.4f}  "
+                    f"R2={r.r2:.4f}  NMAE={r.nmae:.3f} "
+                    f"(MAE={r.mae_pct_typical:.1f}% median |target|){marker}"
+                )
+            if lot_cv_results:
+                print(f"    Leave-one-lot-out MAE ({p.unit}; used for model selection):")
+                for name, r in lot_cv_results.items():
+                    marker = "  <== selected" if name == best_name else ""
+                    per_lot = ", ".join(
+                        f"{lot}={mae:.4f}"
+                        for lot, mae in zip(r.fold_group_labels, r.fold_mae)
+                        if lot is not None
+                    )
+                    print(f"      {name:28s} mean={r.mae:.4f}  [{per_lot}]{marker}")
+            print("    Baselines are evaluated alongside regressors; selection uses lowest MAE.")
+            print()
 
         best_cv = cv_results[best_name]
-        conformal = fit_conformal(best_cv.oof_true, best_cv.oof_predictions, alpha=CONFORMAL_ALPHA)
-
-        # Refit the best model on the FULL dataset for deployment use,
-        # while safety metrics / intervals are calibrated from the
-        # honest out-of-fold predictions above (never in-sample).
         best_pipeline = zoo[best_name]
-        best_pipeline.fit(X, y)
+        best_pipeline.fit(X_fit, y_fit)
+        calibration_predictions = pd.DataFrame()
+        if len(cal_idx):
+            calibration_point_predictions = np.asarray(
+                best_pipeline.predict(X.iloc[cal_idx]), dtype=float
+            )
+            if best_name == QRF_MODEL_NAME:
+                cal_quantiles = predict_qrf_quantiles(
+                    best_pipeline, X.iloc[cal_idx], alpha=CONFORMAL_ALPHA
+                )
+                conformal = fit_conformalized_quantiles(
+                    y.iloc[cal_idx].to_numpy(),
+                    cal_quantiles[:, 0],
+                    cal_quantiles[:, 1],
+                    alpha=CONFORMAL_ALPHA,
+                )
+            else:
+                conformal = fit_conformal(
+                    y.iloc[cal_idx].to_numpy(),
+                    calibration_point_predictions,
+                    alpha=CONFORMAL_ALPHA,
+                )
+            calibration_predictions = pd.DataFrame({
+                "Component_ID": groups.iloc[cal_idx].to_numpy(),
+                "Lot_ID": (
+                    lot_ids.iloc[cal_idx].to_numpy() if lot_ids is not None else None
+                ),
+                "Parameter": p.name,
+                "Model": best_name,
+                "Prediction_Basis": "Held-out component split (not used to fit/select point model)",
+                "Actual_168h": y.iloc[cal_idx].to_numpy(),
+                "Predicted_168h": calibration_point_predictions,
+            })
+        else:
+            # Fallback for too few groups: cross-validated residual calibration
+            # is approximate and should be treated as exploratory.
+            if best_name == QRF_MODEL_NAME:
+                conformal = fit_conformalized_quantiles(
+                    best_cv.oof_true,
+                    best_cv.oof_quantile_lower,
+                    best_cv.oof_quantile_upper,
+                    alpha=CONFORMAL_ALPHA,
+                )
+            else:
+                conformal = fit_conformal(
+                    best_cv.oof_true, best_cv.oof_predictions, alpha=CONFORMAL_ALPHA
+                )
 
         value_0h = X[f"{p.name}_0h"].values
-        oof_decisions = []
-        for true_val, pred_val in zip(best_cv.oof_true, best_cv.oof_predictions):
-            if np.isnan(pred_val):
-                oof_decisions.append("REVIEW")
-                continue
-            lo, hi = predict_interval(pred_val, conformal)
-            d = evaluate_safety(
-                value_0h=0.0,  # placeholder, replaced per-row below
-                value_24h=0.0,
-                pred_168h=pred_val,
-                pred_low=lo,
-                pred_high=hi,
-                param_cfg=p,
-            )
-            oof_decisions.append(d.decision)
+        value_24h = X[f"{p.name}_24h"].values
+        qrf_selected = best_name == QRF_MODEL_NAME
+        oof_result = split_conformal_oof(
+            zoo[best_name], X, y, groups, best_name,
+            n_folds=n_folds, alpha=CONFORMAL_ALPHA,
+            lot_ids=lot_ids, early_24=value_24h if lot_ids is not None else None,
+            compare_qrf_intervals=qrf_selected,
+        )
+        interval_comparison = {}
+        if qrf_selected:
+            (
+                safety_pred,
+                safety_low,
+                safety_high,
+                safety_lot_z,
+                symmetric_intervals,
+            ) = oof_result
+        else:
+            safety_pred, safety_low, safety_high, safety_lot_z = oof_result
 
-        # Recompute decisions properly using each row's actual value_0h
-        oof_decisions = []
-        for v0, pred_val in zip(value_0h, best_cv.oof_predictions):
-            if np.isnan(pred_val):
-                oof_decisions.append("REVIEW")
-                continue
-            lo, hi = predict_interval(pred_val, conformal)
-            d = evaluate_safety(v0, v0, pred_val, lo, hi, p)
-            oof_decisions.append(d.decision)
+        def decisions_for_interval(lower, upper):
+            return [
+                evaluate_safety(v0, v24, pred, lo, hi, p, lot_z_24h=z).decision
+                for v0, v24, pred, lo, hi, z in zip(
+                    value_0h, value_24h, safety_pred, lower, upper, safety_lot_z
+                )
+            ]
+
+        oof_decisions = decisions_for_interval(safety_low, safety_high)
 
         safety_metrics = safety_confusion_metrics(
-            y_true_168h=best_cv.oof_true,
+            y_true_168h=y.to_numpy(),
             value_0h=value_0h,
             decisions=oof_decisions,
             param_cfg=p,
         )
+
+        if qrf_selected:
+            symmetric_decisions = decisions_for_interval(
+                symmetric_intervals["symmetric_low"],
+                symmetric_intervals["symmetric_high"],
+            )
+            symmetric_metrics = safety_confusion_metrics(
+                y_true_168h=y.to_numpy(),
+                value_0h=value_0h,
+                decisions=symmetric_decisions,
+                param_cfg=p,
+            )
+
+            def summarize_intervals(lower, upper, metrics):
+                lower = np.asarray(lower, dtype=float)
+                upper = np.asarray(upper, dtype=float)
+                covered = (y.to_numpy() >= lower) & (y.to_numpy() <= upper)
+                return {
+                    "coverage": float(np.mean(covered)),
+                    "mean_width": float(np.mean(upper - lower)),
+                    "review_count": metrics["review_count"],
+                    "reject_count": metrics["reject_count"],
+                    "flagged_count": metrics["review_count"] + metrics["reject_count"],
+                    "recall": metrics["recall_sensitivity"],
+                    "false_positive_rate": metrics["false_positive_rate"],
+                    "specificity": metrics["specificity"],
+                }
+
+            interval_comparison = {
+                "symmetric_conformal": summarize_intervals(
+                    symmetric_intervals["symmetric_low"],
+                    symmetric_intervals["symmetric_high"],
+                    symmetric_metrics,
+                ),
+                "qrf_conformalized_quantiles": summarize_intervals(
+                    safety_low, safety_high, safety_metrics
+                ),
+            }
 
         if verbose:
             cm = safety_metrics["confusion_matrix"]
@@ -137,8 +278,23 @@ def train_all_parameters(df: pd.DataFrame, n_folds: int = N_GROUP_FOLDS,
                   f"Precision={safety_metrics['precision']:.3f}  "
                   f"FNR={safety_metrics['false_negative_rate']:.3f}  "
                   f"FPR={safety_metrics['false_positive_rate']:.3f}  "
+                  f"Specificity={safety_metrics['specificity']:.3f}  "
+                  f"REVIEW={safety_metrics['review_count']}  "
+                  f"REJECT={safety_metrics['reject_count']}  "
+                  f"threshold={safety_metrics['relative_drift_threshold']:.3f}  "
                   f"CM={cm}")
             print()
+            if interval_comparison:
+                for method, metrics in interval_comparison.items():
+                    print(
+                        f"    {method}: coverage={metrics['coverage']:.3f}  "
+                        f"mean_width={metrics['mean_width']:.4f}  "
+                        f"REVIEW={metrics['review_count']}  "
+                        f"REJECT={metrics['reject_count']}  "
+                        f"Recall={metrics['recall']:.3f}  "
+                        f"FPR={metrics['false_positive_rate']:.3f}"
+                    )
+                print()
 
         system.bundles[p.name] = ParameterModelBundle(
             param_cfg=p,
@@ -148,10 +304,13 @@ def train_all_parameters(df: pd.DataFrame, n_folds: int = N_GROUP_FOLDS,
             conformal=conformal,
             feature_columns=list(X.columns),
             safety_metrics=safety_metrics,
+            interval_comparison=interval_comparison,
+            explanation_reference=X_fit.median(axis=0),
+            lot_cv_results=lot_cv_results,
+            calibration_predictions=calibration_predictions,
         )
 
-    # Store a lot-level reference table (mean/std per parameter per lot)
-    # so inference on brand-new components can compute consistent z-scores.
+    # Keep lot-level reference values for new components.
     if "Lot_ID" in df.columns:
         system.lot_reference = df[["Lot_ID"] + [
             c for p in system.bundles for c in [f"{p}_0h", f"{p}_24h"] if c in df.columns
@@ -161,7 +320,8 @@ def train_all_parameters(df: pd.DataFrame, n_folds: int = N_GROUP_FOLDS,
 
 
 def predict_component(system: TrainedSystem, component_row: pd.DataFrame,
-                       lot_reference_df: Optional[pd.DataFrame] = None) -> Dict[str, dict]:
+                       lot_reference_df: Optional[pd.DataFrame] = None,
+                       include_explanations: bool = True) -> Dict[str, dict]:
     """
     Score a single new component (one-row DataFrame with raw 0h/24h/lot
     columns) across every trained parameter. Returns a dict keyed by
@@ -173,6 +333,13 @@ def predict_component(system: TrainedSystem, component_row: pd.DataFrame,
     system.lot_reference captured at training time.
     """
     ref = lot_reference_df if lot_reference_df is not None else system.lot_reference
+    if (
+        ref is not None
+        and "Component_ID" in ref.columns
+        and "Component_ID" in component_row.columns
+    ):
+        scored_id = component_row.iloc[0]["Component_ID"]
+        ref = ref[ref["Component_ID"] != scored_id]
     results = {}
 
     for pname, bundle in system.bundles.items():
@@ -182,43 +349,46 @@ def predict_component(system: TrainedSystem, component_row: pd.DataFrame,
         if col0 not in component_row.columns or col24 not in component_row.columns:
             continue
 
-        # Build features using lot context if available so z-scores are
-        # computed against real peers rather than a single-row "lot" of 1.
-        if ref is not None and "Lot_ID" in component_row.columns:
-            lot_id = component_row.iloc[0]["Lot_ID"]
-            context_cols = [c for c in [col0, col24, "Lot_ID"] if c in ref.columns]
-            if context_cols and "Lot_ID" in context_cols:
-                context = ref[ref["Lot_ID"] == lot_id]
-                combined = pd.concat([context, component_row], ignore_index=True, sort=False)
-                X_full = build_features_for_parameter(combined, pname)
-                X_row = X_full.iloc[[-1]][bundle.feature_columns]
-            else:
-                X_row = build_features_for_parameter(component_row, pname)[bundle.feature_columns]
-        else:
-            X_row = build_features_for_parameter(component_row, pname)[bundle.feature_columns]
+        X_full = build_features_for_parameter(
+            component_row, pname, include_lot_stats=False
+        )
+        X_row = X_full[bundle.feature_columns]
 
         pred = float(bundle.pipeline.predict(X_row)[0])
-        lo, hi = predict_interval(pred, bundle.conformal)
+        if isinstance(bundle.conformal, QuantileConformalCalibration):
+            quantiles = predict_qrf_quantiles(
+                bundle.pipeline, X_row, alpha=bundle.conformal.alpha
+            )
+            lower, upper = predict_quantile_intervals(
+                quantiles[:, 0], quantiles[:, 1], bundle.conformal
+            )
+            lo, hi = float(lower[0]), float(upper[0])
+        else:
+            lo, hi = predict_interval(pred, bundle.conformal)
 
         v0 = float(component_row.iloc[0][col0])
         v24 = float(component_row.iloc[0][col24])
-        z24 = float(X_row.iloc[0].get(f"{pname}_z_24h", np.nan))
-
+        z24 = np.nan
+        if ref is not None and "Lot_ID" in component_row.columns and "Lot_ID" in ref.columns:
+            lot_ref = ref[ref["Lot_ID"] == component_row.iloc[0]["Lot_ID"]]
+            reference = lot_ref[col24] if len(lot_ref) >= MIN_LOT_SIZE_FOR_STATS else ref[col24]
+            if len(reference):
+                z24 = (v24 - float(reference.mean())) / max(float(reference.std(ddof=0)), 1e-9)
         decision = evaluate_safety(v0, v24, pred, lo, hi, cfg, lot_z_24h=z24)
-
-        low_conf = low_confidence_flag(pred, bundle.conformal)
-        if low_conf and decision.decision == "SAFE":
-            decision.decision = "REVIEW"
-            decision.reasons.append(
-                "Downgraded from SAFE to REVIEW: prediction interval too wide "
-                "relative to the predicted value for a confident automatic decision."
-            )
 
         implausible = bool(physics_plausibility_flags(
             np.array([v0]), np.array([v24]), np.array([pred]), cfg
         )[0])
 
-        contributions = explain_prediction(bundle.best_model_name, bundle.pipeline, X_row)
+        contributions = (
+            explain_prediction(
+                bundle.best_model_name,
+                bundle.pipeline,
+                X_row,
+                reference_features=getattr(bundle, "explanation_reference", None),
+            )
+            if include_explanations else None
+        )
 
         results[pname] = {
             "value_0h": v0,

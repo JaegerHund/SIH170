@@ -1,26 +1,4 @@
-"""
-uncertainty.py
---------------
-Uncertainty estimation for predicted 168h values (spec section 10).
-
-Method chosen: split conformal prediction using out-of-fold residuals
-from group cross-validation. This is:
-  - simple and defensible (distribution-free, finite-sample coverage
-    guarantee under exchangeability)
-  - cheap to compute
-  - avoids the complexity/opacity of Bayesian or deep-learning approaches
-    the spec explicitly says to avoid
-
-Given out-of-fold absolute residuals |y_true - y_pred| from CV, the
-conformal quantile q_hat = the (1-alpha) quantile of those residuals
-(with the standard finite-sample correction) defines a constant-width
-interval: [pred - q_hat, pred + q_hat].
-
-We also offer a locally-weighted variant (normalized conformal) that
-scales the interval by a rough local difficulty estimate (|X_24h - X_0h|
-magnitude) so components with larger/noisier early drift get
-appropriately wider intervals instead of one-size-fits-all bands.
-"""
+"""Calibrate prediction intervals with held-out residuals."""
 
 from dataclasses import dataclass
 from typing import Optional
@@ -38,13 +16,24 @@ class ConformalCalibration:
     method: str = "absolute_residual"
 
 
+@dataclass
+class QuantileConformalCalibration:
+    """Calibration for conformalized, input-dependent quantile intervals."""
+    q_hat: float
+    alpha: float
+    n_calibration: int
+    lower_quantile: float
+    upper_quantile: float
+    method: str = "conformalized_quantile_regression"
+
+
 def fit_conformal(oof_true: np.ndarray, oof_pred: np.ndarray,
                    alpha: float = CONFORMAL_ALPHA) -> ConformalCalibration:
     """
-    Fit a split-conformal calibration from out-of-fold (true, predicted)
-    pairs. These MUST be out-of-fold (i.e. the model never trained on the
-    point when producing that prediction) or the resulting interval will
-    be overconfident.
+    Fit split-conformal calibration from held-out (true, predicted) pairs.
+    The estimator that produced `oof_pred` must not have trained on those
+    calibration rows. Calibration can be from a dedicated holdout or from
+    an inner cross-validation procedure.
     """
     mask = ~np.isnan(oof_pred) & ~np.isnan(oof_true)
     resid = np.abs(oof_true[mask] - oof_pred[mask])
@@ -52,26 +41,96 @@ def fit_conformal(oof_true: np.ndarray, oof_pred: np.ndarray,
     if n == 0:
         raise ValueError("No valid out-of-fold predictions to calibrate conformal intervals.")
 
-    # finite-sample corrected quantile level
-    level = min(1.0, np.ceil((n + 1) * (1 - alpha)) / n)
-    q_hat = float(np.quantile(resid, level))
+    # Split-conformal order statistic. If the requested finite-sample rank is
+    # beyond the available calibration residuals, the valid interval is unbounded.
+    rank = int(np.ceil((n + 1) * (1 - alpha)))
+    if rank > n:
+        q_hat = float("inf")
+    else:
+        q_hat = float(np.partition(resid, rank - 1)[rank - 1])
     return ConformalCalibration(q_hat=q_hat, alpha=alpha, n_calibration=n)
+
+
+def fit_conformalized_quantiles(y_true: np.ndarray, lower_pred: np.ndarray,
+                                upper_pred: np.ndarray,
+                                alpha: float = CONFORMAL_ALPHA,
+                                lower_quantile: Optional[float] = None,
+                                upper_quantile: Optional[float] = None
+                                ) -> QuantileConformalCalibration:
+    """Calibrate lower/upper quantile predictions with split conformal scores.
+
+    The score is ``max(lower - y, y - upper)``. The conformal correction is
+    constrained to be nonnegative, so it only expands the QRF interval and
+    cannot turn it into an inverted interval.
+    """
+    y_true = np.asarray(y_true, dtype=float)
+    lower_pred = np.asarray(lower_pred, dtype=float)
+    upper_pred = np.asarray(upper_pred, dtype=float)
+    if not (y_true.shape == lower_pred.shape == upper_pred.shape):
+        raise ValueError("Truth and lower/upper quantile predictions must have matching shapes.")
+    if not 0 < alpha < 1:
+        raise ValueError("alpha must be between 0 and 1.")
+
+    mask = np.isfinite(y_true) & np.isfinite(lower_pred) & np.isfinite(upper_pred)
+    y_true = y_true[mask]
+    lower_pred = lower_pred[mask]
+    upper_pred = upper_pred[mask]
+    if np.any(lower_pred > upper_pred):
+        raise ValueError("Lower quantile predictions must not exceed upper predictions.")
+
+    scores = np.maximum(lower_pred - y_true, y_true - upper_pred)
+    n = len(scores)
+    if n == 0:
+        raise ValueError("No valid quantile calibration rows were provided.")
+
+    rank = int(np.ceil((n + 1) * (1 - alpha)))
+    if rank > n:
+        q_hat = float("inf")
+    else:
+        q_hat = float(np.partition(scores, rank - 1)[rank - 1])
+    q_hat = max(q_hat, 0.0)
+
+    return QuantileConformalCalibration(
+        q_hat=q_hat,
+        alpha=alpha,
+        n_calibration=n,
+        lower_quantile=lower_quantile if lower_quantile is not None else alpha / 2,
+        upper_quantile=upper_quantile if upper_quantile is not None else 1 - alpha / 2,
+    )
 
 
 def predict_interval(point_pred: float, calibration: ConformalCalibration):
     """Return (lower, upper) for a single point prediction."""
+    if isinstance(calibration, QuantileConformalCalibration):
+        raise ValueError("QRF intervals require native lower/upper quantiles; use predict_quantile_intervals.")
     lo = point_pred - calibration.q_hat
     hi = point_pred + calibration.q_hat
     return lo, hi
 
 
 def predict_intervals(point_preds: np.ndarray, calibration: ConformalCalibration):
+    if isinstance(calibration, QuantileConformalCalibration):
+        raise ValueError("QRF intervals require native lower/upper quantiles; use predict_quantile_intervals.")
     lo = point_preds - calibration.q_hat
     hi = point_preds + calibration.q_hat
     return lo, hi
 
 
-def interval_width(calibration: ConformalCalibration) -> float:
+def predict_quantile_intervals(lower_preds: np.ndarray, upper_preds: np.ndarray,
+                               calibration: QuantileConformalCalibration):
+    """Expand predicted quantile bounds by their calibrated correction."""
+    lower_preds = np.asarray(lower_preds, dtype=float)
+    upper_preds = np.asarray(upper_preds, dtype=float)
+    return lower_preds - calibration.q_hat, upper_preds + calibration.q_hat
+
+
+def interval_width(calibration: ConformalCalibration,
+                   lower_pred: Optional[float] = None,
+                   upper_pred: Optional[float] = None) -> float:
+    if isinstance(calibration, QuantileConformalCalibration):
+        if lower_pred is None or upper_pred is None:
+            raise ValueError("QRF interval width requires predicted lower and upper quantiles.")
+        return (upper_pred - lower_pred) + 2 * calibration.q_hat
     return 2 * calibration.q_hat
 
 

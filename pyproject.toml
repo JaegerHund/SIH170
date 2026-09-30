@@ -11,10 +11,14 @@ dependencies = [
     "pandas",
     "numpy",
     "scikit-learn",
+    "quantile-forest",
     "xgboost",
     "matplotlib",
     "shap",
 ]
+
+[project.optional-dependencies]
+app = ["streamlit>=1.35"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

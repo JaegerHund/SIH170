@@ -1,14 +1,4 @@
-"""
-data_validation.py
--------------------
-Validates a raw ESS dataframe before feature engineering.
-
-Designed to be flexible about which parameters/timepoints are actually
-present (spec section 3: "the exact dataset may differ, so make the
-implementation flexible"). It inspects the dataframe's columns and infers
-which of config.PARAMETERS are usable, rather than assuming all of them
-are present.
-"""
+"""Check input columns and values before model training."""
 
 from dataclasses import dataclass, field
 from typing import Dict, List
@@ -30,24 +20,57 @@ class ValidationReport:
     warnings: List[str] = field(default_factory=list)
     n_rows_in: int = 0
     n_rows_after_dropna_target: Dict[str, int] = field(default_factory=dict)
+    data_source: str = "unspecified"
+    synthetic_profile: str = ""
 
     def summary(self) -> str:
-        lines = [
-            "=== Data Validation Report ===",
-            f"Input rows: {self.n_rows_in}",
-            f"Usable parameters ({len(self.usable_parameters)}): "
-            f"{[p.name for p in self.usable_parameters]}",
-        ]
+        lines = ["DATASET VALIDATION SUMMARY", "=" * 72]
+        lines.append(f"Rows received: {self.n_rows_in:,}")
+        source = self.data_source
+        if self.synthetic_profile:
+            source += f" (profile: {self.synthetic_profile})"
+        lines.append(f"Data source:   {source}")
+        lines.append("")
+        lines.append(
+            f"Usable parameters: {len(self.usable_parameters)} / "
+            f"{len(self.usable_parameters) + len(self.missing_parameters)}"
+        )
+        if self.usable_parameters:
+            name_width = max(9, *(len(p.name) for p in self.usable_parameters))
+            lines.append(
+                f"  {'Parameter':<{name_width}}  {'Early inputs':<16}  "
+                f"{'168h target rows':>16}  {'Training coverage':>17}"
+            )
+            lines.append(
+                f"  {'-' * name_width}  {'-' * 16}  {'-' * 16}  {'-' * 17}"
+            )
+            for p in self.usable_parameters:
+                n_target = self.n_rows_after_dropna_target.get(p.name, 0)
+                coverage = f"{n_target / self.n_rows_in:.0%}" if self.n_rows_in else "—"
+                target_rows = f"{n_target:,}" if n_target else "unavailable"
+                lines.append(
+                    f"  {p.name:<{name_width}}  {'0h + 24h':<16}  "
+                    f"{target_rows:>16}  {coverage:>17}"
+                )
         if self.missing_parameters:
-            lines.append(f"Parameters skipped (missing required columns): "
-                          f"{self.missing_parameters}")
+            lines.append("")
+            lines.append(
+                "Skipped parameters (missing required 0h/24h columns): "
+                + ", ".join(self.missing_parameters)
+            )
         if self.missing_id_columns:
-            lines.append(f"Missing recommended ID columns: {self.missing_id_columns} "
-                          f"(lot-normalization / group validation may be degraded)")
-        for w in self.warnings:
-            lines.append(f"WARNING: {w}")
-        for pname, n in self.n_rows_after_dropna_target.items():
-            lines.append(f"  {pname}: {n} rows have a usable target ({TARGET_TIMEPOINT}h)")
+            lines.append("")
+            lines.append(
+                "Missing recommended ID columns: "
+                + ", ".join(self.missing_id_columns)
+                + " (lot normalization or group validation may be limited)"
+            )
+        if self.warnings:
+            lines.extend(["", f"Warnings ({len(self.warnings)}):"])
+            lines.extend(f"  {i}. {warning}" for i, warning in enumerate(self.warnings, 1))
+        else:
+            lines.extend(["", "Warnings: none"])
+        lines.append("=" * 72)
         return "\n".join(lines)
 
 
@@ -63,6 +86,14 @@ def validate_dataset(df: pd.DataFrame) -> ValidationReport:
     only raises on truly unusable input (no Component_ID, empty df).
     """
     report = ValidationReport(n_rows_in=len(df))
+    if "Data_Source" in df.columns and df["Data_Source"].nunique(dropna=True) == 1:
+        report.data_source = str(df["Data_Source"].dropna().iloc[0])
+    elif "Data_Source" in df.columns:
+        report.data_source = "mixed"
+    if "Synthetic_Profile" in df.columns and df["Synthetic_Profile"].nunique(dropna=True) == 1:
+        report.synthetic_profile = str(df["Synthetic_Profile"].dropna().iloc[0])
+    elif "Synthetic_Profile" in df.columns:
+        report.synthetic_profile = "mixed"
 
     if len(df) == 0:
         raise ValueError("Dataset is empty.")

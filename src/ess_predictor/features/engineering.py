@@ -1,29 +1,9 @@
-"""
-feature_engineering.py
------------------------
-Builds physically meaningful derived features for a single parameter,
-per spec section 4:
-
-  - Absolute measurements:      X_0h, X_24h, (X_96h if present)
-  - Early drift:                dX_0_24 = X_24h - X_0h
-  - Relative drift:              (X_24h - X_0h) / |X_0h|   (safe div-by-zero)
-  - Drift rate:                  (X_24h - X_0h) / 24
-  - Lot-normalized z-scores:     Z_X0 = (X_0h - LotMean_0h) / LotStd_0h
-                                  Z_X24 = (X_24h - LotMean_24h) / LotStd_24h
-                                  Z_dX  = (dX_0_24 - LotMean_dX) / LotStd_dX
-
-No manual polynomial expansion is added here (spec: "do not create
-unnecessary polynomial features manually if the selected ML model can
-handle them") -- PolynomialFeatures is applied only inside the dedicated
-polynomial-regression model pipeline (models.py).
-"""
-
-from typing import List, Optional
+"""Build per-parameter features from early readouts."""
 
 import numpy as np
 import pandas as pd
 
-from ess_predictor.config import MIN_LOT_SIZE_FOR_STATS, EARLY_TIMEPOINTS, OPTIONAL_TIMEPOINTS
+from ess_predictor.config import MIN_LOT_SIZE_FOR_STATS, EARLY_TIMEPOINTS
 
 
 EPS = 1e-9  # safety epsilon for division-by-zero guards
@@ -59,7 +39,8 @@ def build_features_for_parameter(
     df: pd.DataFrame,
     param_name: str,
     lot_col: str = "Lot_ID",
-    include_96h: bool = True,
+    include_96h: bool = False,
+    include_lot_stats: bool = True,
 ) -> pd.DataFrame:
     """
     Given the raw dataframe and a parameter name (e.g. "Iddq"), return a
@@ -99,14 +80,7 @@ def build_features_for_parameter(
     # --- Drift rate (per hour) ---
     out[f"{p}_drift_rate_0_24"] = (x24 - x0) / 24.0
 
-    if has_96:
-        x96 = df[col96].astype(float)
-        out[f"{p}_dX_24_96"] = x96 - x24
-        out[f"{p}_relative_drift_24_96"] = _safe_relative_drift(x96, x24)
-        out[f"{p}_drift_rate_24_96"] = (x96 - x24) / (96.0 - 24.0)
-
-    # --- Lot-normalized z-scores ---
-    if lot_col in df.columns:
+    if include_lot_stats and lot_col in df.columns:
         mean0, std0 = _lot_stats(df.assign(**{col0: x0}), col0, lot_col)
         mean24, std24 = _lot_stats(df.assign(**{col24: x24}), col24, lot_col)
         out[f"{p}_z_0h"] = (x0 - mean0) / std0
@@ -116,14 +90,18 @@ def build_features_for_parameter(
         tmp = df.assign(**{dcol: x24 - x0})
         mean_d, std_d = _lot_stats(tmp, dcol, lot_col)
         out[f"{p}_z_dX_0_24"] = ((x24 - x0) - mean_d) / std_d
-    else:
-        # No lot column available: z-scores fall back to global stats,
-        # still meaningful (population-relative deviation), just not
-        # lot-specific. This keeps the pipeline usable on flexible schemas.
+    elif include_lot_stats:
+        # No lot column available: use global early-measurement statistics.
         out[f"{p}_z_0h"] = (x0 - x0.mean()) / max(x0.std(ddof=0), EPS)
         out[f"{p}_z_24h"] = (x24 - x24.mean()) / max(x24.std(ddof=0), EPS)
         d = x24 - x0
         out[f"{p}_z_dX_0_24"] = (d - d.mean()) / max(d.std(ddof=0), EPS)
+
+    if has_96:
+        x96 = df[col96].astype(float)
+        out[f"{p}_dX_24_96"] = x96 - x24
+        out[f"{p}_relative_drift_24_96"] = _safe_relative_drift(x96, x24)
+        out[f"{p}_drift_rate_24_96"] = (x96 - x24) / (96.0 - 24.0)
 
     return out
 
@@ -132,16 +110,28 @@ def build_feature_matrix(
     df: pd.DataFrame,
     param_name: str,
     lot_col: str = "Lot_ID",
-    include_96h: bool = True,
+    include_96h: bool = False,
+    include_lot_stats: bool = False,
 ):
     """
-    Convenience wrapper: returns (X, y, feature_names) for a given
+    Convenience wrapper: returns (X, y, groups) for a given
     parameter, where y is the 168h target (NaN rows dropped) and X is
     aligned to y's remaining index. Rows without a valid target are
     excluded here -- this is the ONLY place target-based filtering happens,
     keeping feature engineering itself target-agnostic and leak-free.
     """
-    X_all = build_features_for_parameter(df, param_name, lot_col, include_96h)
+    if include_96h:
+        raise ValueError(
+            "Prediction feature matrices are restricted to 0h/24h inputs; "
+            "96h values are future information for the 168h prediction task."
+        )
+    X_all = build_features_for_parameter(
+        df,
+        param_name,
+        lot_col=lot_col,
+        include_96h=False,
+        include_lot_stats=include_lot_stats,
+    )
     target_col = f"{param_name}_168h"
     if target_col not in df.columns:
         return X_all, None, list(X_all.columns)

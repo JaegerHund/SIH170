@@ -1,13 +1,4 @@
-"""
-robustness.py
---------------
-Measurement-noise sensitivity testing (spec section 11).
-
-Perturbs 0h/24h input measurements within a realistic measurement-error
-band and observes how much the predicted 168h value moves. A robust model
-should not produce wildly different predictions for tiny, realistic
-measurement changes.
-"""
+"""Check how input measurement noise affects 168 h predictions."""
 
 from typing import Callable, List
 
